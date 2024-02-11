@@ -21,6 +21,7 @@ below, clang-format doesn't work (at least on my version) with the c-style comme
 #include <aws/common/condition_variable.h>
 #include <aws/common/mutex.h>
 #include <aws/common/task_scheduler.h>
+#include <aws/common/uuid.h>
 
 #include <aws/io/event_loop.h>
 #include <aws/io/logging.h>
@@ -34,7 +35,7 @@ below, clang-format doesn't work (at least on my version) with the c-style comme
 #include <stdlib.h>
 #include <string.h>
 
-#if _MSC_VER
+#ifdef _MSC_VER
 #    pragma warning(disable : 4221) /* aggregate initializer using local variable addresses */
 #    pragma warning(disable : 4204) /* non-constant aggregate initializer */
 #endif
@@ -678,7 +679,7 @@ static int s_ipv4_stream_connection_success(struct aws_socket *socket) {
     if (getsockopt(
             (SOCKET)socket->io_handle.data.handle, SOL_SOCKET, SO_ERROR, (char *)&connect_result, &result_length) < 0) {
         int wsa_err = WSAGetLastError(); /* logging may reset error, so cache it */
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p handle=%p: failed to determine connection error %d",
             (void *)socket,
@@ -689,7 +690,7 @@ static int s_ipv4_stream_connection_success(struct aws_socket *socket) {
     }
 
     if (connect_result) {
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p handle=%p: connection error %d",
             (void *)socket,
@@ -739,7 +740,7 @@ static int s_ipv6_stream_connection_success(struct aws_socket *socket) {
     if (getsockopt(
             (SOCKET)socket->io_handle.data.handle, SOL_SOCKET, SO_ERROR, (char *)&connect_result, &result_length) < 0) {
         int wsa_err = WSAGetLastError(); /* logging may reset error, so cache it */
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p handle=%p: failed to determine connection error %d",
             (void *)socket,
@@ -750,7 +751,7 @@ static int s_ipv6_stream_connection_success(struct aws_socket *socket) {
     }
 
     if (connect_result) {
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p handle=%p: connection error %d",
             (void *)socket,
@@ -805,7 +806,7 @@ static int s_local_and_udp_connection_success(struct aws_socket *socket) {
 static void s_connection_error(struct aws_socket *socket, int error) {
     socket->state = ERRORED;
 
-    AWS_LOGF_ERROR(
+    AWS_LOGF_DEBUG(
         AWS_LS_IO_SOCKET,
         "id=%p handle=%p: connection error with code %d",
         (void *)socket,
@@ -987,7 +988,7 @@ static inline int s_tcp_connect(
     if (!connect_res) {
         int error_code = WSAGetLastError();
         if (error_code != ERROR_IO_PENDING) {
-            AWS_LOGF_ERROR(
+            AWS_LOGF_DEBUG(
                 AWS_LS_IO_TLS,
                 "id=%p handle=%p: connection error %d",
                 (void *)socket,
@@ -1219,7 +1220,7 @@ static int s_local_connect(
 
 error:;
     int win_error = GetLastError(); /* logging may reset error, so cache it */
-    AWS_LOGF_ERROR(
+    AWS_LOGF_DEBUG(
         AWS_LS_IO_SOCKET,
         "id=%p handle=%p: failed to connect to named pipe %s.",
         (void *)socket,
@@ -1266,7 +1267,7 @@ static inline int s_dgram_connect(
 
     if (connect_err) {
         int wsa_err = WSAGetLastError(); /* logging may reset error, so cache it */
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p handle=%p: Failed to connect to %s:%d with error %d.",
             (void *)socket,
@@ -3231,4 +3232,13 @@ int aws_socket_get_error(struct aws_socket *socket) {
 
 bool aws_socket_is_open(struct aws_socket *socket) {
     return socket->io_handle.data.handle != INVALID_HANDLE_VALUE;
+}
+
+void aws_socket_endpoint_init_local_address_for_test(struct aws_socket_endpoint *endpoint) {
+    struct aws_uuid uuid;
+    AWS_FATAL_ASSERT(aws_uuid_init(&uuid) == AWS_OP_SUCCESS);
+    char uuid_str[AWS_UUID_STR_LEN] = {0};
+    struct aws_byte_buf uuid_buf = aws_byte_buf_from_empty_array(uuid_str, sizeof(uuid_str));
+    AWS_FATAL_ASSERT(aws_uuid_to_str(&uuid, &uuid_buf) == AWS_OP_SUCCESS);
+    snprintf(endpoint->address, sizeof(endpoint->address), "\\\\.\\pipe\\testsock" PRInSTR, AWS_BYTE_BUF_PRI(uuid_buf));
 }

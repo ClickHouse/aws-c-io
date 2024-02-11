@@ -9,6 +9,7 @@
 #include <aws/common/condition_variable.h>
 #include <aws/common/mutex.h>
 #include <aws/common/string.h>
+#include <aws/common/uuid.h>
 
 #include <aws/io/event_loop.h>
 #include <aws/io/logging.h>
@@ -383,7 +384,7 @@ static int s_on_connection_success(struct aws_socket *socket) {
 
     if (getsockopt(socket->io_handle.data.fd, SOL_SOCKET, SO_ERROR, &connect_result, &result_length) < 0) {
         int errno_value = errno; /* Always cache errno before potential side-effect */
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p fd=%d: failed to determine connection error %d",
             (void *)socket,
@@ -396,7 +397,7 @@ static int s_on_connection_success(struct aws_socket *socket) {
     }
 
     if (connect_result) {
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p fd=%d: connection error %d",
             (void *)socket,
@@ -436,7 +437,7 @@ static int s_on_connection_success(struct aws_socket *socket) {
 
 static void s_on_connection_error(struct aws_socket *socket, int error) {
     socket->state = ERROR;
-    AWS_LOGF_ERROR(AWS_LS_IO_SOCKET, "id=%p fd=%d: connection failure", (void *)socket, socket->io_handle.data.fd);
+    AWS_LOGF_DEBUG(AWS_LS_IO_SOCKET, "id=%p fd=%d: connection failure", (void *)socket, socket->io_handle.data.fd);
     if (socket->connection_result_fn) {
         socket->connection_result_fn(socket, error, socket->connect_accept_user_data);
     } else if (socket->accept_result_fn) {
@@ -673,7 +674,7 @@ int aws_socket_connect(
 
     if (pton_err != 1) {
         int errno_value = errno; /* Always cache errno before potential side-effect */
-        AWS_LOGF_ERROR(
+        AWS_LOGF_DEBUG(
             AWS_LS_IO_SOCKET,
             "id=%p fd=%d: failed to parse address %s:%d.",
             (void *)socket,
@@ -769,7 +770,7 @@ int aws_socket_connect(
                 (unsigned long long)timeout);
             aws_event_loop_schedule_task_future(event_loop, timeout_task, timeout);
         } else {
-            AWS_LOGF_ERROR(
+            AWS_LOGF_DEBUG(
                 AWS_LS_IO_SOCKET,
                 "id=%p fd=%d: connect failed with error code %d.",
                 (void *)socket,
@@ -1272,6 +1273,7 @@ int aws_socket_set_options(struct aws_socket *socket, const struct aws_socket_op
             }
         }
 
+#if !defined(__OpenBSD__)
         if (socket->options.keep_alive_interval_sec && socket->options.keep_alive_timeout_sec) {
             int ival_in_secs = socket->options.keep_alive_interval_sec;
             if (AWS_UNLIKELY(setsockopt(
@@ -1311,6 +1313,7 @@ int aws_socket_set_options(struct aws_socket *socket, const struct aws_socket_op
                     errno_value);
             }
         }
+#endif /* __OpenBSD__ */
     }
 
     return AWS_OP_SUCCESS;
@@ -1904,4 +1907,13 @@ int aws_socket_get_error(struct aws_socket *socket) {
 
 bool aws_socket_is_open(struct aws_socket *socket) {
     return socket->io_handle.data.fd >= 0;
+}
+
+void aws_socket_endpoint_init_local_address_for_test(struct aws_socket_endpoint *endpoint) {
+    struct aws_uuid uuid;
+    AWS_FATAL_ASSERT(aws_uuid_init(&uuid) == AWS_OP_SUCCESS);
+    char uuid_str[AWS_UUID_STR_LEN] = {0};
+    struct aws_byte_buf uuid_buf = aws_byte_buf_from_empty_array(uuid_str, sizeof(uuid_str));
+    AWS_FATAL_ASSERT(aws_uuid_to_str(&uuid, &uuid_buf) == AWS_OP_SUCCESS);
+    snprintf(endpoint->address, sizeof(endpoint->address), "testsock" PRInSTR ".sock", AWS_BYTE_BUF_PRI(uuid_buf));
 }
