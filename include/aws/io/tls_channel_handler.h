@@ -34,14 +34,22 @@ enum aws_tls_cipher_pref {
     /* Deprecated */ AWS_IO_TLS_CIPHER_PREF_KMS_PQ_TLSv1_0_2020_02 = 3,
     /* Deprecated */ AWS_IO_TLS_CIPHER_PREF_KMS_PQ_SIKE_TLSv1_0_2020_02 = 4,
     /* Deprecated */ AWS_IO_TLS_CIPHER_PREF_KMS_PQ_TLSv1_0_2020_07 = 5,
+    /* Deprecated */ AWS_IO_TLS_CIPHER_PREF_PQ_TLSv1_0_2021_05 = 6,
 
     /*
-     * This TLS cipher preference list contains post-quantum key exchange algorithms that have been submitted to NIST
-     * for potential future standardization. Support for this preference list, or PQ algorithms present in it, may be
-     * removed at any time in the future. PQ algorithms in this preference list will be used in hybrid mode, and always
-     * combined with a classical ECDHE key exchange.
+     * This TLS cipher preference list contains post-quantum key exchange algorithms that have been standardized by
+     * NIST. PQ algorithms in this preference list will be used in hybrid mode, and always combined with a classical
+     * ECDHE key exchange.
      */
-    AWS_IO_TLS_CIPHER_PREF_PQ_TLSv1_0_2021_05 = 6,
+    AWS_IO_TLS_CIPHER_PREF_PQ_TLSV1_2_2024_10 = 7,
+
+    /* Recommended default policy with post-quantum algorithm support. This policy may change over time. */
+    AWS_IO_TLS_CIPHER_PREF_PQ_DEFAULT = 8,
+
+    /* This security policy is based on AWS-CRT-SDK-TLSv1.2-2023 (the default when a minimum TLS version is TLS 1.2),
+     * with tightened security. This security policy is FIPS-complaint.
+     */
+    AWS_IO_TLS_CIPHER_PREF_TLSV1_2_2025_07 = 9,
 
     AWS_IO_TLS_CIPHER_PREF_END_RANGE = 0xFFFF
 };
@@ -88,6 +96,9 @@ struct aws_tls_ctx {
 /**
  * Invoked upon completion of the TLS handshake. If successful error_code will be AWS_OP_SUCCESS, otherwise
  * the negotiation failed and immediately after this function is invoked, the channel will be shutting down.
+ *
+ * NOTE: When using SecItem the handler and slot arguments will be pointers to the socket slot and socket handler. This
+ * is due to TLS negotiaion being handled by the Apple Network Framework connection in the socket slot/handler.
  */
 typedef void(aws_tls_on_negotiation_result_fn)(
     struct aws_channel_handler *handler,
@@ -145,6 +156,26 @@ struct aws_tls_connection_options {
  * to be operated on, like performing a sign operation or a decrypt operation.
  */
 struct aws_tls_key_operation;
+
+/**
+ * A struct containing parameters used during import of Certificate and Private Key into a
+ * data protection keychain using Apple's SecItem API.
+ */
+struct aws_secitem_options {
+    /**
+     * Human-Readable identifier tag for certificate being used in keychain.
+     * Value will be used with kSecAttrLabel Key in SecItem functions.
+     * If one is not provided, we generate it ourselves.
+     */
+    struct aws_string *cert_label;
+
+    /**
+     * Human-Readable identifier tag for private key being used in keychain.
+     * Value will be used with kSecAttrLabel Key in SecItem functions.
+     * If one is not provided, we generate it ourselves.
+     */
+    struct aws_string *key_label;
+};
 
 struct aws_tls_ctx_options {
     struct aws_allocator *allocator;
@@ -214,15 +245,19 @@ struct aws_tls_ctx_options {
      */
     struct aws_byte_buf pkcs12_password;
 
-#    if !defined(AWS_OS_IOS)
     /**
-     * On Apple OS you can also use a custom keychain instead of
-     * the default keychain of the account.
+     * On iOS/tvOS the available settings when adding items to the keychain using
+     * SecItem are contained within this struct. This is NOT supported on MacOS.
+     */
+    struct aws_secitem_options secitem_options;
+
+    /**
+     * On MacOS you can also use a custom keychain instead of
+     * the default keychain of the account. This is NOT supported on iOS.
      */
     struct aws_string *keychain_path;
-#    endif
 
-#endif
+#endif /* __APPLE__ */
 
     /** max tls fragment size. Default is the value of g_aws_channel_max_fragment_size. */
     size_t max_fragment_size;
@@ -278,11 +313,10 @@ enum aws_tls_negotiation_status {
  * aws_tls_handler_new_fn contains multiple callbacks. Namely: aws_tls_on_negotiation_result_fn. You are responsible for
  * invoking this function when TLs session negotiation has completed.
  */
-typedef struct aws_channel_handler *(aws_tls_handler_new_fn)(
-    struct aws_allocator *allocator,
-    struct aws_tls_connection_options *options,
-    struct aws_channel_slot *slot,
-    void *user_data);
+typedef struct aws_channel_handler *(aws_tls_handler_new_fn)(struct aws_allocator *allocator,
+                                                             struct aws_tls_connection_options *options,
+                                                             struct aws_channel_slot *slot,
+                                                             void *user_data);
 
 /**
  * Invoked when it's time to start TLS negotiation. Note: the aws_tls_options passed to your aws_tls_handler_new_fn
@@ -319,8 +353,6 @@ AWS_IO_API void aws_tls_ctx_options_clean_up(struct aws_tls_ctx_options *options
  * cert_path and pkey_path are paths to files on disk. cert_path
  * and pkey_path are treated as PKCS#7 PEM armored. They are loaded
  * from disk and stored in buffers internally.
- *
- * NOTE: This is unsupported on iOS.
  */
 AWS_IO_API int aws_tls_ctx_options_init_client_mtls_from_path(
     struct aws_tls_ctx_options *options,
@@ -332,8 +364,6 @@ AWS_IO_API int aws_tls_ctx_options_init_client_mtls_from_path(
  * Initializes options for use with mutual tls in client mode.
  * cert and pkey are copied. cert and pkey are treated as PKCS#7 PEM
  * armored.
- *
- * NOTE: This is unsupported on iOS.
  */
 AWS_IO_API int aws_tls_ctx_options_init_client_mtls(
     struct aws_tls_ctx_options *options,
@@ -511,6 +541,24 @@ AWS_IO_API int aws_tls_ctx_options_set_keychain_path(
     struct aws_byte_cursor *keychain_path_cursor);
 
 /**
+ * Applies provided SecItem options to certificate and private key being
+ * added to the iOS/tvOS KeyChain.
+ *
+ * NOTE: Currently only supported on iOS and tvOS using SecItem.
+ *
+ * @param options           aws_tls_ctx_options to be modified.
+ * @param secitem_options   Options for SecItems
+ */
+AWS_IO_API int aws_tls_ctx_options_set_secitem_options(
+    struct aws_tls_ctx_options *tls_ctx_options,
+    const struct aws_secitem_options *secitem_options);
+
+/**
+ * Cleans up resources in secitem_options.
+ */
+AWS_IO_API void aws_tls_secitem_options_clean_up(struct aws_secitem_options *secitem_options);
+
+/**
  * Initializes options for use with in server mode.
  * cert_path and pkey_path are paths to files on disk. cert_path
  * and pkey_path are treated as PKCS#7 PEM armored. They are loaded
@@ -675,7 +723,8 @@ AWS_IO_API void aws_tls_connection_options_init_from_ctx(
 AWS_IO_API void aws_tls_connection_options_clean_up(struct aws_tls_connection_options *connection_options);
 
 /**
- * Copies 'from' to 'to'
+ * Cleans up 'to' and copies 'from' to 'to'.
+ * 'to' must be initialized.
  */
 AWS_IO_API int aws_tls_connection_options_copy(
     struct aws_tls_connection_options *to,
@@ -804,18 +853,6 @@ AWS_IO_API struct aws_tls_ctx *aws_tls_ctx_acquire(struct aws_tls_ctx *ctx);
 AWS_IO_API void aws_tls_ctx_release(struct aws_tls_ctx *ctx);
 
 /**
- * Not necessary if you are installing more handlers into the channel, but if you just want to have TLS for arbitrary
- * data and use the channel handler directly, this function allows you to write data to the channel and have it
- * encrypted.
- */
-AWS_IO_API int aws_tls_handler_write(
-    struct aws_channel_handler *handler,
-    struct aws_channel_slot *slot,
-    struct aws_byte_buf *buf,
-    aws_channel_on_message_write_completed_fn *on_write_completed,
-    void *completion_user_data);
-
-/**
  * Returns a byte buffer by copy of the negotiated protocols. If there is no agreed upon protocol, len will be 0 and
  * buffer will be NULL.
  */
@@ -914,6 +951,11 @@ const char *aws_tls_signature_algorithm_str(enum aws_tls_signature_algorithm sig
  */
 AWS_IO_API
 const char *aws_tls_key_operation_type_str(enum aws_tls_key_operation_type operation_type);
+
+/**
+ * Returns true if error_code is a TLS Negotiation related error.
+ */
+AWS_IO_API bool aws_error_code_is_tls(int error_code);
 
 AWS_EXTERN_C_END
 AWS_POP_SANE_WARNING_LEVEL

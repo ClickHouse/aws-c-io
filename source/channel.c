@@ -12,6 +12,7 @@
 #include <aws/io/event_loop.h>
 #include <aws/io/logging.h>
 #include <aws/io/message_pool.h>
+#include <aws/io/private/event_loop_impl.h>
 #include <aws/io/statistics.h>
 
 #ifdef _MSC_VER
@@ -256,6 +257,10 @@ struct aws_channel *aws_channel_new(struct aws_allocator *alloc, const struct aw
     setup_args->on_setup_completed = creation_args->on_setup_completed;
     setup_args->user_data = creation_args->setup_user_data;
 
+    /* keep loop alive until channel is destroyed */
+    channel->loop = creation_args->event_loop;
+    aws_event_loop_group_acquire_from_event_loop(channel->loop);
+
     aws_task_init(&setup_args->task, s_on_channel_setup_complete, setup_args, "on_channel_setup_complete");
     aws_event_loop_schedule_task_now(creation_args->event_loop, &setup_args->task);
 
@@ -306,6 +311,8 @@ static void s_final_channel_deletion_task(struct aws_task *task, void *arg, enum
     aws_array_list_clean_up(&channel->statistic_list);
 
     aws_channel_set_statistics_handler(channel, NULL);
+
+    aws_event_loop_group_release_from_event_loop(channel->loop);
 
     aws_mem_release(channel->alloc, channel);
 }
@@ -422,18 +429,15 @@ struct aws_io_message *aws_channel_acquire_message_from_pool(
     size_t size_hint) {
 
     struct aws_io_message *message = aws_message_pool_acquire(channel->msg_pool, message_type, size_hint);
-
-    if (AWS_LIKELY(message)) {
-        message->owning_channel = channel;
-        AWS_LOGF_TRACE(
-            AWS_LS_IO_CHANNEL,
-            "id=%p: acquired message %p of capacity %zu from pool %p. Requested size was %zu",
-            (void *)channel,
-            (void *)message,
-            message->message_data.capacity,
-            (void *)channel->msg_pool,
-            size_hint);
-    }
+    message->owning_channel = channel;
+    AWS_LOGF_TRACE(
+        AWS_LS_IO_CHANNEL,
+        "id=%p: acquired message %p of capacity %zu from pool %p. Requested size was %zu",
+        (void *)channel,
+        (void *)message,
+        message->message_data.capacity,
+        (void *)channel->msg_pool,
+        size_hint);
 
     return message;
 }
@@ -743,7 +747,7 @@ int aws_channel_slot_insert_end(struct aws_channel *channel, struct aws_channel_
     }
 
     AWS_ASSERT(0);
-    return AWS_OP_ERR;
+    return aws_raise_error(AWS_ERROR_INVALID_STATE);
 }
 
 int aws_channel_slot_insert_left(struct aws_channel_slot *slot, struct aws_channel_slot *to_add) {
@@ -818,12 +822,8 @@ struct aws_io_message *aws_channel_slot_acquire_max_message_for_write(struct aws
     AWS_PRECONDITION(aws_channel_thread_is_callers_thread(slot->channel));
 
     const size_t overhead = aws_channel_slot_upstream_message_overhead(slot);
-    if (overhead >= g_aws_channel_max_fragment_size) {
-        AWS_LOGF_ERROR(
-            AWS_LS_IO_CHANNEL, "id=%p: Upstream overhead exceeds channel's max message size.", (void *)slot->channel);
-        aws_raise_error(AWS_ERROR_INVALID_STATE);
-        return NULL;
-    }
+    AWS_FATAL_ASSERT(
+        overhead < g_aws_channel_max_fragment_size && "Upstream overhead cannot exceed channel's max message size");
 
     const size_t size_hint = g_aws_channel_max_fragment_size - overhead;
     return aws_channel_acquire_message_from_pool(slot->channel, AWS_IO_MESSAGE_APPLICATION_DATA, size_hint);
@@ -835,7 +835,7 @@ static void s_window_update_task(struct aws_channel_task *channel_task, void *ar
 
     channel->window_update_scheduled = false;
 
-    if (status == AWS_TASK_STATUS_RUN_READY && channel->channel_state < AWS_CHANNEL_SHUTTING_DOWN) {
+    if (status == AWS_TASK_STATUS_RUN_READY && channel->channel_state < AWS_CHANNEL_SHUT_DOWN) {
         /* get the right-most slot to start the updates. */
         struct aws_channel_slot *slot = channel->first;
         while (slot->adj_right) {
@@ -865,7 +865,7 @@ static void s_window_update_task(struct aws_channel_task *channel_task, void *ar
 
 int aws_channel_slot_increment_read_window(struct aws_channel_slot *slot, size_t window) {
 
-    if (slot->channel->read_back_pressure_enabled && slot->channel->channel_state < AWS_CHANNEL_SHUTTING_DOWN) {
+    if (slot->channel->read_back_pressure_enabled && slot->channel->channel_state < AWS_CHANNEL_SHUT_DOWN) {
         slot->current_window_update_batch_size =
             aws_add_size_saturating(slot->current_window_update_batch_size, window);
 
@@ -890,12 +890,13 @@ int aws_channel_slot_shutdown(
     AWS_LOGF_TRACE(
         AWS_LS_IO_CHANNEL,
         "id=%p: shutting down slot %p, with handler %p "
-        "in %s direction with error code %d",
+        "in %s direction with error code %d : %s",
         (void *)slot->channel,
         (void *)slot,
         (void *)slot->handler,
         (dir == AWS_CHANNEL_DIR_READ) ? "read" : "write",
-        err_code);
+        err_code,
+        aws_error_name(err_code));
     return aws_channel_handler_shutdown(slot->handler, slot, dir, err_code, free_scarce_resources_immediately);
 }
 

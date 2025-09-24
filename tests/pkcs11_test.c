@@ -60,12 +60,6 @@ struct pkcs11_key_creation_params {
     const CK_ULONG key_length;
 };
 
-/*
- * Helper functions to interact with softhsm begin
- * */
-
-static int s_run_cmd(const char *fmt, ...);
-
 /* Wipe out all existing tokens by deleting and recreating the SoftHSM token dir */
 static int s_pkcs11_clear_softhsm(void) {
     ASSERT_SUCCESS(aws_directory_delete(s_pkcs11_tester.token_dir, true /*recursive*/));
@@ -171,8 +165,8 @@ static int s_pkcs11_create_rsa_key(
     /* We only support RSA keys today. */
     CK_MECHANISM smech = {CKM_RSA_PKCS_KEY_PAIR_GEN, NULL, 0};
     /* Define key template */
-    static CK_BBOOL truevalue = TRUE;
-    static CK_BBOOL falsevalue = FALSE;
+    static CK_BBOOL truevalue = CK_TRUE;
+    static CK_BBOOL falsevalue = CK_FALSE;
 
     /* Set public key. Not sure if setting modulus_bits actually generates key as per that. */
     CK_ATTRIBUTE publickey_template[] = {
@@ -217,8 +211,8 @@ static int s_pkcs11_create_ec_key(
 
     CK_MECHANISM smech = {CKM_EC_KEY_PAIR_GEN, NULL, 0};
     /* Define key template */
-    static CK_BBOOL truevalue = TRUE;
-    static CK_BBOOL falsevalue = FALSE;
+    static CK_BBOOL truevalue = CK_TRUE;
+    static CK_BBOOL falsevalue = CK_FALSE;
     /* DER encoded params for curve P-256 */
     static CK_BYTE ec_params[] = {0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07};
 
@@ -1493,6 +1487,9 @@ AWS_TEST_CASE(pkcs11_sign_ec_256, s_test_pkcs11_sign_ec_256)
 
 #ifndef BYO_CRYPTO
 
+/*
+ * Helper function to interact with softhsm begin
+ */
 static int s_run_cmd(const char *fmt, ...) {
     char cmd[1024];
     va_list args;
@@ -1656,8 +1653,10 @@ static int s_test_pkcs11_tls_negotiation_succeeds_common(
     ASSERT_SUCCESS(aws_mutex_init(&s_tls_tester.synced.mutex));
     ASSERT_SUCCESS(aws_condition_variable_init(&s_tls_tester.synced.cvar));
 
-    struct aws_event_loop_group *event_loop_group =
-        aws_event_loop_group_new_default(allocator, 1, NULL /*shutdown_opts*/);
+    struct aws_event_loop_group_options elg_options = {
+        .loop_count = 1,
+    };
+    struct aws_event_loop_group *event_loop_group = aws_event_loop_group_new(allocator, &elg_options);
     ASSERT_NOT_NULL(event_loop_group);
 
     struct aws_host_resolver_default_options resolver_opts = {

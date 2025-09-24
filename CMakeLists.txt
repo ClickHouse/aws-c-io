@@ -1,31 +1,11 @@
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.9...3.31)
 project(aws-c-io C)
 
-if (POLICY CMP0069)
-    cmake_policy(SET CMP0069 NEW) # Enable LTO/IPO if available in the compiler, see AwsCFlags
+if (NOT IN_SOURCE_BUILD)
+    # this is required so we can use aws-c-common's CMake modules
+    find_package(aws-c-common REQUIRED)
 endif()
-
-if (DEFINED CMAKE_PREFIX_PATH)
-    file(TO_CMAKE_PATH "${CMAKE_PREFIX_PATH}" CMAKE_PREFIX_PATH)
-endif()
-
-if (DEFINED CMAKE_INSTALL_PREFIX)
-    file(TO_CMAKE_PATH "${CMAKE_INSTALL_PREFIX}" CMAKE_INSTALL_PREFIX)
-endif()
-
-
-if (UNIX AND NOT APPLE)
-    include(GNUInstallDirs)
-elseif(NOT DEFINED CMAKE_INSTALL_LIBDIR)
-    set(CMAKE_INSTALL_LIBDIR "lib")
-endif()
-
-# This is required in order to append /lib/cmake to each element in CMAKE_PREFIX_PATH
-set(AWS_MODULE_DIR "/${CMAKE_INSTALL_LIBDIR}/cmake")
-string(REPLACE ";" "${AWS_MODULE_DIR};" AWS_MODULE_PATH "${CMAKE_PREFIX_PATH}${AWS_MODULE_DIR}")
-# Append that generated list to the module search path
-list(APPEND CMAKE_MODULE_PATH ${AWS_MODULE_PATH})
 
 include(AwsCFlags)
 include(AwsCheckHeaders)
@@ -33,6 +13,7 @@ include(AwsSharedLibSetup)
 include(AwsSanitizers)
 include(AwsFindPackage)
 include(CTest)
+include(GNUInstallDirs)
 
 option(BUILD_RELOCATABLE_BINARIES
         "Build Relocatable Binaries, this will turn off features that will fail on older kernels than used for the build."
@@ -42,10 +23,6 @@ option(BYO_CRYPTO "Don't build a tls implementation or link against a crypto int
 
 file(GLOB AWS_IO_HEADERS
         "include/aws/io/*.h"
-        )
-
-file(GLOB AWS_IO_UV_HEADERS
-        "include/aws/io/uv/*.h"
         )
 
 file(GLOB AWS_IO_TESTING_HEADERS
@@ -83,7 +60,7 @@ if (WIN32)
                 )
          list(APPEND AWS_IO_OS_SRC ${AWS_IO_IOCP_SRC})
 
-         set(EVENT_LOOP_DEFINE "IO_COMPLETION_PORTS")
+         list(APPEND EVENT_LOOP_DEFINES "IO_COMPLETION_PORTS")
     endif ()
 
     if (MSVC)
@@ -95,7 +72,7 @@ if (WIN32)
     #platform libs come from aws-c-common transitively, so we don't specify them here, but for documentation purposes,
     #Kernel32 and wsock2 are pulled in automatically. Here we add the lib containing the schannel API.
     #Also note, you don't get a choice on TLS implementation for Windows.
-    set(PLATFORM_LIBS Secur32 Crypt32)
+    set(PLATFORM_LIBS secur32 crypt32)
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
     option(USE_VSOCK
 	    "Build in support for VSOCK sockets"
@@ -110,7 +87,7 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Androi
             )
     set(PLATFORM_LIBS "")
 
-    set(EVENT_LOOP_DEFINE "EPOLL")
+    list(APPEND EVENT_LOOP_DEFINES "EPOLL")
     set(USE_S2N ON)
 
 elseif (APPLE)
@@ -125,13 +102,18 @@ elseif (APPLE)
             )
 
     find_library(SECURITY_LIB Security)
-    if (NOT SECURITY_LIB)
-        message(FATAL_ERROR "Security framework not found")
+    find_library(NETWORK_LIB Network)
+
+    # Enable dispatch queue if the libraries are avaliable
+    if (NETWORK_LIB AND SECURITY_LIB)
+        list(APPEND PLATFORM_LIBS "-framework Security -framework Network")
+        list(APPEND EVENT_LOOP_DEFINES "DISPATCH_QUEUE")
     endif ()
 
-    #No choice on TLS for apple, darwinssl will always be used.
-    list(APPEND PLATFORM_LIBS "-framework Security")
-    set(EVENT_LOOP_DEFINE "KQUEUE")
+    # Enable KQUEUE on MacOS only if AWS_USE_SECITEM is not declared. SecItem requires Dispatch Queue.
+    if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin" AND NOT DEFINED AWS_USE_SECITEM)
+        list(APPEND EVENT_LOOP_DEFINES "KQUEUE")
+    endif()
 
 elseif (CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "NetBSD" OR CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
     file(GLOB AWS_IO_OS_HEADERS
@@ -142,7 +124,7 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "NetB
             "source/posix/*.c"
             )
 
-    set(EVENT_LOOP_DEFINE "KQUEUE")
+    list(APPEND EVENT_LOOP_DEFINES "KQUEUE")
     set(USE_S2N ON)
 
 endif()
@@ -156,10 +138,21 @@ if (BYO_CRYPTO)
 endif()
 
 if (USE_S2N)
-    file(GLOB AWS_IO_TLS_SRC
-            "source/s2n/*.c"
-            )
-    aws_use_package(s2n)
+        file(GLOB AWS_IO_TLS_SRC
+                "source/s2n/*.c"
+                )
+        # Prefer find_package() because it's the normal CMake way to do dependencies.
+        # But fall back on aws_use_package() because some projects still need to do an IN_SOURCE_BUILD of S2N.
+        # (e.g. aws-crt-java until this is resolved: https://github.com/awslabs/aws-crt-java/pull/817)
+        find_package(s2n QUIET)
+
+        if (s2n_FOUND)
+            list(APPEND DEP_AWS_LIBS AWS::s2n)
+        else()
+            # Set flag to use in-source path to  <s2n/unstable/*.h> headers if we do an IN_SOURCE_BUILD.
+            aws_use_package(s2n)
+            add_definitions(-DAWS_S2N_INSOURCE_PATH)
+        endif()
 endif()
 
 file(GLOB IO_HEADERS
@@ -184,7 +177,16 @@ aws_add_sanitizers(${PROJECT_NAME})
 # We are not ABI stable yet
 set_target_properties(${PROJECT_NAME} PROPERTIES VERSION 1.0.0)
 
-target_compile_definitions(${PROJECT_NAME} PUBLIC "-DAWS_USE_${EVENT_LOOP_DEFINE}")
+if (NOT EVENT_LOOP_DEFINES)
+    message(FATAL_ERROR "Event Loop is not setup on the platform.")
+endif()
+foreach(EVENT_LOOP_DEFINE IN LISTS EVENT_LOOP_DEFINES)
+    target_compile_definitions(${PROJECT_NAME} PUBLIC "-DAWS_ENABLE_${EVENT_LOOP_DEFINE}")
+endforeach()
+
+if (AWS_USE_SECITEM)
+    target_compile_definitions(${PROJECT_NAME} PUBLIC "-DAWS_USE_SECITEM")
+endif()
 
 if (BYO_CRYPTO)
     target_compile_definitions(${PROJECT_NAME} PUBLIC "-DBYO_CRYPTO")
@@ -199,7 +201,15 @@ if (BUILD_RELOCATABLE_BINARIES)
 endif()
 
 if (USE_VSOCK)
-	target_compile_definitions(${PROJECT_NAME} PUBLIC "-DUSE_VSOCK")
+    target_compile_definitions(${PROJECT_NAME} PUBLIC "-DUSE_VSOCK")
+endif()
+
+if (AWS_USE_APPLE_NETWORK_FRAMEWORK)
+    target_compile_definitions(${PROJECT_NAME} PUBLIC "-DAWS_USE_APPLE_NETWORK_FRAMEWORK")
+endif()
+
+if (AWS_USE_APPLE_DISPATCH_QUEUE)
+    target_compile_definitions(${PROJECT_NAME} PUBLIC "-DAWS_USE_APPLE_DISPATCH_QUEUE")
 endif()
 
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -213,8 +223,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE ${PLATFORM_LIBS})
 
 aws_prepare_shared_lib_exports(${PROJECT_NAME})
 
-install(FILES ${AWS_IO_HEADERS} DESTINATION "include/aws/io" COMPONENT Development)
-install(FILES ${AWS_IO_TESTING_HEADERS} DESTINATION "include/aws/testing" COMPONENT Development)
+install(FILES ${AWS_IO_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/aws/io" COMPONENT Development)
+install(FILES ${AWS_IO_TESTING_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/aws/testing" COMPONENT Development)
 
 if (BUILD_SHARED_LIBS)
    set (TARGET_DIR "shared")
@@ -223,7 +233,7 @@ else()
 endif()
 
 install(EXPORT "${PROJECT_NAME}-targets"
-        DESTINATION "${LIBRARY_DIRECTORY}/${PROJECT_NAME}/cmake/${TARGET_DIR}"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}/${TARGET_DIR}"
         NAMESPACE AWS::
         COMPONENT Development)
 
@@ -232,7 +242,7 @@ configure_file("cmake/${PROJECT_NAME}-config.cmake"
         @ONLY)
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
-        DESTINATION "${LIBRARY_DIRECTORY}/${PROJECT_NAME}/cmake/"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}/"
         COMPONENT Development)
 
 if (NOT CMAKE_CROSSCOMPILING)
