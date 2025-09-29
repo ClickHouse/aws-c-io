@@ -7,7 +7,9 @@
 #include <aws/io/channel.h>
 #include <aws/io/file_utils.h>
 #include <aws/io/private/pki_utils.h>
+#include <aws/io/private/socket_impl.h>
 #include <aws/io/private/tls_channel_handler_shared.h>
+#include <aws/io/socket_channel_handler.h>
 #include <aws/io/statistics.h>
 
 #include <aws/io/logging.h>
@@ -23,6 +25,8 @@
 #include <Security/Security.h>
 #include <dlfcn.h>
 #include <math.h>
+
+#include "./dispatch_queue_event_loop_private.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -74,7 +78,11 @@ void aws_tls_init_static_state(struct aws_allocator *alloc) {
     s_SSLSetALPNProtocols = (OSStatus(*)(SSLContextRef, CFArrayRef))dlsym(RTLD_DEFAULT, "SSLSetALPNProtocols");
     s_SSLCopyALPNProtocols = (OSStatus(*)(SSLContextRef, CFArrayRef *))dlsym(RTLD_DEFAULT, "SSLCopyALPNProtocols");
 
-    AWS_LOGF_INFO(AWS_LS_IO_TLS, "static: initializing TLS implementation as Apple SecureTransport.");
+    if (aws_is_using_secitem()) {
+        AWS_LOGF_INFO(AWS_LS_IO_TLS, "static: initializing TLS implementation as Apple SecItem.");
+    } else {
+        AWS_LOGF_INFO(AWS_LS_IO_TLS, "static: initializing TLS implementation as Apple SecureTransport.");
+    }
 
     if (s_SSLSetALPNProtocols) {
         AWS_LOGF_INFO(AWS_LS_IO_TLS, "static: ALPN support detected.");
@@ -85,8 +93,7 @@ void aws_tls_init_static_state(struct aws_allocator *alloc) {
     }
 }
 
-void aws_tls_clean_up_static_state(void) { /* no op */
-}
+void aws_tls_clean_up_static_state(void) { /* no op */ }
 
 struct secure_transport_handler {
     struct aws_channel_handler handler;
@@ -112,6 +119,8 @@ struct secure_transport_handler {
     bool negotiation_finished;
     bool verify_peer;
     bool read_task_pending;
+    enum aws_tls_handler_read_state read_state;
+    int delay_shutdown_error_code;
 };
 
 static OSStatus s_read_cb(SSLConnectionRef conn, void *data, size_t *len) {
@@ -167,7 +176,8 @@ static OSStatus s_write_cb(SSLConnectionRef conn, const void *data, size_t *len)
         struct aws_io_message *message = aws_channel_acquire_message_from_pool(
             handler->parent_slot->channel, AWS_IO_MESSAGE_APPLICATION_DATA, message_size_hint);
 
-        if (!message || message->message_data.capacity <= overhead) {
+        if (message->message_data.capacity <= overhead) {
+            aws_mem_release(message->allocator, message);
             return errSecMemoryError;
         }
 
@@ -335,7 +345,7 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
                     &secure_transport_handler->protocol, handler->alloc, (size_t)CFStringGetLength(protocol) + 1)) {
                 CFRelease(protocol);
                 s_invoke_negotiation_callback(handler, AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
-                return AWS_OP_ERR;
+                return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
             }
 
             memset(secure_transport_handler->protocol.buffer, 0, secure_transport_handler->protocol.capacity);
@@ -399,7 +409,7 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
         if (secure_transport_handler->verify_peer) {
             if (!secure_transport_handler->ca_certs) {
                 s_invoke_negotiation_callback(handler, AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
-                return AWS_OP_ERR;
+                return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
             }
 
             SecTrustRef trust;
@@ -407,7 +417,7 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
 
             if (status != errSecSuccess) {
                 s_invoke_negotiation_callback(handler, AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
-                return AWS_OP_ERR;
+                return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
             }
 
             SecPolicyRef policy;
@@ -428,7 +438,7 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
                 AWS_LOGF_ERROR(AWS_LS_IO_TLS, "id=%p: Failed to set trust policy %d\n", (void *)handler, (int)status);
                 CFRelease(trust);
                 s_invoke_negotiation_callback(handler, AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
-                return AWS_OP_ERR;
+                return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
             }
 
             status = SecTrustSetAnchorCertificates(trust, secure_transport_handler->ca_certs);
@@ -440,7 +450,7 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
                     (int)status);
                 CFRelease(trust);
                 s_invoke_negotiation_callback(handler, AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
-                return AWS_OP_ERR;
+                return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
             }
 
             /* Use ONLY the custom CA bundle (ignoring system anchors) */
@@ -453,7 +463,7 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
                     (int)status);
                 CFRelease(trust);
                 s_invoke_negotiation_callback(handler, AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
-                return AWS_OP_ERR;
+                return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
             }
 
             SecTrustResultType trust_eval = 0;
@@ -471,7 +481,7 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
                 (void *)handler,
                 (int)status,
                 (int)trust_eval);
-            return AWS_OP_ERR;
+            return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
         }
         return s_drive_negotiation(handler);
         /* if this is here, everything went wrong. */
@@ -479,9 +489,8 @@ static int s_drive_negotiation(struct aws_channel_handler *handler) {
         secure_transport_handler->negotiation_finished = false;
 
         AWS_LOGF_WARN(AWS_LS_IO_TLS, "id=%p: negotiation failed with OSStatus %d.", (void *)handler, (int)status);
-        aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
         s_invoke_negotiation_callback(handler, AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
-        return AWS_OP_ERR;
+        return aws_raise_error(AWS_IO_TLS_ERROR_NEGOTIATION_FAILURE);
     }
 
     return AWS_OP_SUCCESS;
@@ -505,7 +514,7 @@ int aws_tls_client_handler_start_negotiation(struct aws_channel_handler *handler
         return s_drive_negotiation(handler);
     }
 
-    struct aws_channel_task *negotiation_task = aws_mem_acquire(handler->alloc, sizeof(struct aws_task));
+    struct aws_channel_task *negotiation_task = aws_mem_acquire(handler->alloc, sizeof(struct aws_channel_task));
 
     if (!negotiation_task) {
         return AWS_OP_ERR;
@@ -549,6 +558,41 @@ static int s_process_write_message(
     return AWS_OP_SUCCESS;
 }
 
+static void s_run_read(struct aws_channel_task *task, void *arg, aws_task_status status);
+
+static void s_initialize_read_delay_shutdown(
+    struct aws_channel_handler *handler,
+    struct aws_channel_slot *slot,
+    int error_code) {
+    struct secure_transport_handler *secure_transport_handler = handler->impl;
+    /**
+     * In case of if we have any queued data in the handler after negotiation and we start to shutdown,
+     * make sure we pass those data down the pipeline before we complete the shutdown.
+     */
+    AWS_LOGF_DEBUG(
+        AWS_LS_IO_TLS,
+        "id=%p: TLS handler still have pending data to be delivered during shutdown. Wait until downstream "
+        "reads the data.",
+        (void *)handler);
+    if (aws_channel_slot_downstream_read_window(slot) == 0) {
+        AWS_LOGF_WARN(
+            AWS_LS_IO_TLS,
+            "id=%p: TLS shutdown delayed. Pending data cannot be processed until the flow-control window opens. "
+            " Your application may hang if the read window never opens",
+            (void *)handler);
+    }
+    secure_transport_handler->read_state = AWS_TLS_HANDLER_READ_SHUTTING_DOWN;
+    secure_transport_handler->delay_shutdown_error_code = error_code;
+    if (!secure_transport_handler->read_task_pending) {
+        /* Kick off read, in case data arrives with TLS negotiation. Shutdown starts right after negotiation.
+         * Nothing will kick off read in that case. */
+        secure_transport_handler->read_task_pending = true;
+        aws_channel_task_init(
+            &secure_transport_handler->read_task, s_run_read, handler, "darwin_channel_handler_read_on_delay_shutdown");
+        aws_channel_schedule_task_now(slot->channel, &secure_transport_handler->read_task);
+    }
+}
+
 static int s_handle_shutdown(
     struct aws_channel_handler *handler,
     struct aws_channel_slot *slot,
@@ -557,24 +601,30 @@ static int s_handle_shutdown(
     bool abort_immediately) {
     struct secure_transport_handler *secure_transport_handler = handler->impl;
 
-    if (dir == AWS_CHANNEL_DIR_WRITE) {
+    if (dir == AWS_CHANNEL_DIR_READ) {
+        AWS_LOGF_DEBUG(
+            AWS_LS_IO_TLS, "id=%p: shutting down read direction with error %d.", (void *)handler, error_code);
+        if (!abort_immediately && secure_transport_handler->negotiation_finished &&
+            !aws_linked_list_empty(&secure_transport_handler->input_queue) && slot->adj_right) {
+            s_initialize_read_delay_shutdown(handler, slot, error_code);
+            /* Early out, not complete the shutdown process for the handler until the handler processes the pending
+             * data. */
+            return AWS_OP_SUCCESS;
+        }
+        secure_transport_handler->read_state = AWS_TLS_HANDLER_READ_SHUT_DOWN_COMPLETE;
+    } else {
+        /* Shutdown in write direction */
         if (!abort_immediately && error_code != AWS_IO_SOCKET_CLOSED) {
             AWS_LOGF_TRACE(AWS_LS_IO_TLS, "id=%p: shutting down write direction.", (void *)handler);
             SSLClose(secure_transport_handler->ctx);
         }
-    } else {
-        AWS_LOGF_DEBUG(
-            AWS_LS_IO_TLS,
-            "id=%p: shutting down read direction with error %d. Flushing queues.",
-            (void *)handler,
-            error_code);
-        while (!aws_linked_list_empty(&secure_transport_handler->input_queue)) {
-            struct aws_linked_list_node *node = aws_linked_list_pop_front(&secure_transport_handler->input_queue);
-            struct aws_io_message *message = AWS_CONTAINER_OF(node, struct aws_io_message, queueing_handle);
-            aws_mem_release(message->allocator, message);
-        }
     }
-
+    /* Flushing queues */
+    while (!aws_linked_list_empty(&secure_transport_handler->input_queue)) {
+        struct aws_linked_list_node *node = aws_linked_list_pop_front(&secure_transport_handler->input_queue);
+        struct aws_io_message *message = AWS_CONTAINER_OF(node, struct aws_io_message, queueing_handle);
+        aws_mem_release(message->allocator, message);
+    }
     return aws_channel_slot_on_handler_shutdown_complete(slot, dir, error_code, abort_immediately);
 }
 
@@ -584,6 +634,12 @@ static int s_process_read_message(
     struct aws_io_message *message) {
 
     struct secure_transport_handler *secure_transport_handler = handler->impl;
+    if (secure_transport_handler->read_state == AWS_TLS_HANDLER_READ_SHUT_DOWN_COMPLETE) {
+        if (message) {
+            aws_mem_release(message->allocator, message);
+        }
+        return AWS_OP_SUCCESS;
+    }
 
     if (message) {
         aws_linked_list_push_back(&secure_transport_handler->input_queue, &message->queueing_handle);
@@ -609,64 +665,69 @@ static int s_process_read_message(
         AWS_LS_IO_TLS, "id=%p: downstream window is %llu", (void *)handler, (unsigned long long)downstream_window);
     size_t processed = 0;
 
-    OSStatus status = noErr;
-    while (processed < downstream_window && status == noErr) {
+    int shutdown_error_code = 0;
+    while (processed < downstream_window) {
 
         struct aws_io_message *outgoing_read_message = aws_channel_acquire_message_from_pool(
             slot->channel, AWS_IO_MESSAGE_APPLICATION_DATA, downstream_window - processed);
-        if (!outgoing_read_message) {
-            /* even though this is a failure, this handler has taken ownership of the message */
-            aws_channel_shutdown(secure_transport_handler->parent_slot->channel, aws_last_error());
-            return AWS_OP_SUCCESS;
-        }
 
         size_t read = 0;
-        status = SSLRead(
+        OSStatus status = SSLRead(
             secure_transport_handler->ctx,
             outgoing_read_message->message_data.buffer,
             outgoing_read_message->message_data.capacity,
             &read);
 
         AWS_LOGF_TRACE(AWS_LS_IO_TLS, "id=%p: bytes read %llu", (void *)handler, (unsigned long long)read);
-        if (read <= 0) {
-            aws_mem_release(outgoing_read_message->allocator, outgoing_read_message);
+        if (read > 0) {
+            processed += read;
+            outgoing_read_message->message_data.len = read;
 
-            if (status != errSSLWouldBlock) {
-                AWS_LOGF_ERROR(
-                    AWS_LS_IO_TLS,
-                    "id=%p: error reported during SSLRead. OSStatus code %d",
-                    (void *)handler,
-                    (int)status);
-
-                if (status != errSSLClosedGraceful) {
-                    aws_raise_error(AWS_IO_TLS_ERROR_READ_FAILURE);
-                    aws_channel_shutdown(secure_transport_handler->parent_slot->channel, AWS_IO_TLS_ERROR_READ_FAILURE);
-                } else {
-                    AWS_LOGF_TRACE(AWS_LS_IO_TLS, "id=%p: connection shutting down gracefully.", (void *)handler);
-                    aws_channel_shutdown(secure_transport_handler->parent_slot->channel, AWS_ERROR_SUCCESS);
-                }
+            if (secure_transport_handler->on_data_read) {
+                secure_transport_handler->on_data_read(
+                    handler, slot, &outgoing_read_message->message_data, secure_transport_handler->user_data);
             }
-            continue;
-        };
 
-        processed += read;
-        outgoing_read_message->message_data.len = read;
-
-        if (secure_transport_handler->on_data_read) {
-            secure_transport_handler->on_data_read(
-                handler, slot, &outgoing_read_message->message_data, secure_transport_handler->user_data);
-        }
-
-        if (slot->adj_right) {
-            if (aws_channel_slot_send_message(slot, outgoing_read_message, AWS_CHANNEL_DIR_READ)) {
+            if (slot->adj_right) {
+                if (aws_channel_slot_send_message(slot, outgoing_read_message, AWS_CHANNEL_DIR_READ)) {
+                    aws_mem_release(outgoing_read_message->allocator, outgoing_read_message);
+                    shutdown_error_code = aws_last_error();
+                    goto shutdown_channel;
+                }
+                /* outgoing message was pushed to the input_queue, so this handler owns it now */
+            } else {
                 aws_mem_release(outgoing_read_message->allocator, outgoing_read_message);
-                aws_channel_shutdown(secure_transport_handler->parent_slot->channel, aws_last_error());
-                /* incoming message was pushed to the input_queue, so this handler owns it now */
-                return AWS_OP_SUCCESS;
             }
         } else {
+            /* Nothing was read */
             aws_mem_release(outgoing_read_message->allocator, outgoing_read_message);
         }
+
+        switch (status) {
+            case errSSLWouldBlock:
+                if (secure_transport_handler->read_state == AWS_TLS_HANDLER_READ_SHUTTING_DOWN) {
+                    /* Propagate the shutdown as we blocked now. */
+                    goto shutdown_channel;
+                } else {
+                    break;
+                }
+            case errSSLClosedGraceful:
+                AWS_LOGF_TRACE(AWS_LS_IO_TLS, "id=%p: connection shutting down gracefully.", (void *)handler);
+                goto shutdown_channel;
+            case noErr:
+                /* continue the while loop */
+                continue;
+            default:
+                AWS_LOGF_TRACE(
+                    AWS_LS_IO_TLS, "id=%p: read message processed with OSStatus %d.", (void *)handler, status);
+                /* unexpected error happened */
+                aws_raise_error(AWS_IO_TLS_ERROR_READ_FAILURE);
+                shutdown_error_code = AWS_IO_TLS_ERROR_READ_FAILURE;
+                goto shutdown_channel;
+        }
+
+        /* Break the while loop */
+        break;
     }
     AWS_LOGF_TRACE(
         AWS_LS_IO_TLS,
@@ -674,6 +735,21 @@ static int s_process_read_message(
         (void *)handler,
         (unsigned long long)downstream_window - processed);
 
+    return AWS_OP_SUCCESS;
+
+shutdown_channel:
+    if (secure_transport_handler->read_state == AWS_TLS_HANDLER_READ_SHUTTING_DOWN) {
+        if (secure_transport_handler->delay_shutdown_error_code != 0) {
+            /* Propagate the original error code if it is set. */
+            shutdown_error_code = secure_transport_handler->delay_shutdown_error_code;
+        }
+        /* Continue the shutdown process delayed before. */
+        secure_transport_handler->read_state = AWS_TLS_HANDLER_READ_SHUT_DOWN_COMPLETE;
+        aws_channel_slot_on_handler_shutdown_complete(slot, AWS_CHANNEL_DIR_READ, shutdown_error_code, false);
+    } else {
+        /* Starts the shutdown process */
+        aws_channel_shutdown(slot->channel, shutdown_error_code);
+    }
     return AWS_OP_SUCCESS;
 }
 
@@ -689,6 +765,9 @@ static void s_run_read(struct aws_channel_task *task, void *arg, aws_task_status
 
 static int s_increment_read_window(struct aws_channel_handler *handler, struct aws_channel_slot *slot, size_t size) {
     struct secure_transport_handler *secure_transport_handler = handler->impl;
+    if (secure_transport_handler->read_state == AWS_TLS_HANDLER_READ_SHUT_DOWN_COMPLETE) {
+        return AWS_OP_SUCCESS;
+    }
 
     AWS_LOGF_TRACE(
         AWS_LS_IO_TLS, "id=%p: increment read window message received %llu", (void *)handler, (unsigned long long)size);
@@ -710,13 +789,9 @@ static int s_increment_read_window(struct aws_channel_handler *handler, struct a
         aws_channel_slot_increment_read_window(slot, window_update_size);
     }
 
-    if (secure_transport_handler->negotiation_finished && !secure_transport_handler->read_task.node.next) {
+    if (secure_transport_handler->negotiation_finished && !secure_transport_handler->read_task_pending) {
         /* TLS requires full records before it can decrypt anything. As a result we need to check everything we've
          * buffered instead of just waiting on a read from the socket, or we'll hit a deadlock.
-         *
-         * We have messages in a queue and they need to be run after the socket has popped (even if it didn't have data
-         * to read). Alternatively, s2n reads entire records at a time, so we'll need to grab whatever we can and we
-         * have no idea what's going on inside there. So we need to attempt another read.
          */
         secure_transport_handler->read_task_pending = true;
         aws_channel_task_init(
@@ -754,17 +829,35 @@ static void s_gather_statistics(struct aws_channel_handler *handler, struct aws_
 }
 
 struct aws_byte_buf aws_tls_handler_protocol(struct aws_channel_handler *handler) {
+    if (aws_is_using_secitem()) {
+        /* Apple Network Framework's SecItem API handles both TCP and TLS aspects of a connection and an aws_channel
+         * using it does not have a TLS. The negotiated protocol is stored in the nw_socket and must be retrieved from
+         * the socket rather than a secure_transport_handler. */
+        const struct aws_socket *socket = aws_socket_handler_get_socket(handler);
+        return socket->vtable->socket_get_protocol_fn(socket);
+    }
     struct secure_transport_handler *secure_transport_handler = handler->impl;
     return secure_transport_handler->protocol;
 }
 
 struct aws_byte_buf aws_tls_handler_server_name(struct aws_channel_handler *handler) {
-    struct secure_transport_handler *secure_transport_handler = handler->impl;
+    struct aws_string *server_name = NULL;
+    if (aws_is_using_secitem()) {
+        /* Apple Network Framework's SecItem API handles both TCP and TLS aspects of a connection and an aws_channel
+         * using it does not have a TLS slot. The server_name is stored in the nw_socket and must be retrieved from the
+         * socket rather than a secure_transport_handler. */
+        const struct aws_socket *socket = aws_socket_handler_get_socket(handler);
+        server_name = socket->vtable->socket_get_server_name_fn(socket);
+    } else {
+        struct secure_transport_handler *secure_transport_handler = handler->impl;
+        server_name = secure_transport_handler->server_name;
+    }
+
     const uint8_t *bytes = NULL;
     size_t len = 0;
-    if (secure_transport_handler->server_name) {
-        bytes = secure_transport_handler->server_name->bytes;
-        len = secure_transport_handler->server_name->len;
+    if (server_name) {
+        bytes = server_name->bytes;
+        len = server_name->len;
     }
     return aws_byte_buf_from_array(bytes, len);
 }
@@ -781,16 +874,6 @@ static struct aws_channel_handler_vtable s_handler_vtable = {
     .gather_statistics = s_gather_statistics,
 };
 
-struct secure_transport_ctx {
-    struct aws_tls_ctx ctx;
-    CFAllocatorRef wrapped_allocator;
-    CFArrayRef certs;
-    CFArrayRef ca_cert;
-    enum aws_tls_versions minimum_version;
-    struct aws_string *alpn_list;
-    bool veriify_peer;
-};
-
 static struct aws_channel_handler *s_tls_handler_new(
     struct aws_allocator *allocator,
     struct aws_tls_connection_options *options,
@@ -801,9 +884,6 @@ static struct aws_channel_handler *s_tls_handler_new(
 
     struct secure_transport_handler *secure_transport_handler =
         (struct secure_transport_handler *)aws_mem_calloc(allocator, 1, sizeof(struct secure_transport_handler));
-    if (!secure_transport_handler) {
-        return NULL;
-    }
 
     secure_transport_handler->handler.alloc = allocator;
     secure_transport_handler->handler.impl = secure_transport_handler;
@@ -829,7 +909,7 @@ static struct aws_channel_handler *s_tls_handler_new(
         goto cleanup_st_handler;
     }
 
-    switch (secure_transport_ctx->minimum_version) {
+    switch (secure_transport_ctx->minimum_tls_version) {
         case AWS_IO_SSLv3:
             SSLSetProtocolVersionMin(secure_transport_handler->ctx, kSSLProtocol3);
             break;
@@ -876,9 +956,9 @@ static struct aws_channel_handler *s_tls_handler_new(
     }
 
     OSStatus status = noErr;
-    secure_transport_handler->verify_peer = secure_transport_ctx->veriify_peer;
+    secure_transport_handler->verify_peer = secure_transport_ctx->verify_peer;
 
-    if (!secure_transport_ctx->veriify_peer && protocol_side == kSSLClientSide) {
+    if (!secure_transport_ctx->verify_peer && protocol_side == kSSLClientSide) {
         AWS_LOGF_WARN(
             AWS_LS_IO_TLS,
             "id=%p: x.509 validation has been disabled. "
@@ -894,9 +974,9 @@ static struct aws_channel_handler *s_tls_handler_new(
     secure_transport_handler->ca_certs = NULL;
     if (secure_transport_ctx->ca_cert) {
         secure_transport_handler->ca_certs = secure_transport_ctx->ca_cert;
-        if (protocol_side == kSSLServerSide && secure_transport_ctx->veriify_peer) {
+        if (protocol_side == kSSLServerSide && secure_transport_ctx->verify_peer) {
             SSLSetSessionOption(secure_transport_handler->ctx, kSSLSessionOptionBreakOnClientAuth, true);
-        } else if (secure_transport_ctx->veriify_peer) {
+        } else if (secure_transport_ctx->verify_peer) {
             SSLSetSessionOption(secure_transport_handler->ctx, kSSLSessionOptionBreakOnServerAuth, true);
         }
     }
@@ -957,22 +1037,34 @@ struct aws_channel_handler *aws_tls_server_handler_new(
     return s_tls_handler_new(allocator, options, slot, kSSLServerSide);
 }
 
+void s_aws_release_cert(const void *val, void *context) {
+    (void)context;
+    CFTypeRef cert = (CFTypeRef)val;
+    CFRelease(cert);
+}
+
 static void s_aws_secure_transport_ctx_destroy(struct secure_transport_ctx *secure_transport_ctx) {
     if (secure_transport_ctx == NULL) {
         return;
     }
 
     if (secure_transport_ctx->certs) {
-        aws_release_identity(secure_transport_ctx->certs);
+        if (secure_transport_ctx->cleanup_cert) {
+            CFRange range = CFRangeMake(0, CFArrayGetCount(secure_transport_ctx->certs));
+            CFArrayApplyFunction(secure_transport_ctx->certs, range, s_aws_release_cert, NULL);
+        }
+        CFRelease(secure_transport_ctx->certs);
+    }
+
+    if (secure_transport_ctx->secitem_identity) {
+        CFRelease(secure_transport_ctx->secitem_identity);
     }
 
     if (secure_transport_ctx->ca_cert) {
-        aws_release_certificates(secure_transport_ctx->ca_cert);
+        CFRelease(secure_transport_ctx->ca_cert);
     }
 
-    if (secure_transport_ctx->alpn_list) {
-        aws_string_destroy(secure_transport_ctx->alpn_list);
-    }
+    aws_string_destroy(secure_transport_ctx->alpn_list);
 
     CFRelease(secure_transport_ctx->wrapped_allocator);
     aws_mem_release(secure_transport_ctx->ctx.alloc, secure_transport_ctx);
@@ -980,9 +1072,6 @@ static void s_aws_secure_transport_ctx_destroy(struct secure_transport_ctx *secu
 
 static struct aws_tls_ctx *s_tls_ctx_new(struct aws_allocator *alloc, const struct aws_tls_ctx_options *options) {
     struct secure_transport_ctx *secure_transport_ctx = aws_mem_calloc(alloc, 1, sizeof(struct secure_transport_ctx));
-    if (!secure_transport_ctx) {
-        return NULL;
-    }
 
     if (!aws_tls_is_cipher_pref_supported(options->cipher_pref)) {
         aws_raise_error(AWS_IO_TLS_CIPHER_PREF_UNSUPPORTED);
@@ -991,11 +1080,11 @@ static struct aws_tls_ctx *s_tls_ctx_new(struct aws_allocator *alloc, const stru
     }
 
     secure_transport_ctx->wrapped_allocator = aws_wrapped_cf_allocator_new(alloc);
-    secure_transport_ctx->minimum_version = options->minimum_tls_version;
-
     if (!secure_transport_ctx->wrapped_allocator) {
         goto cleanup_secure_transport_ctx;
     }
+
+    secure_transport_ctx->minimum_tls_version = options->minimum_tls_version;
 
     if (options->alpn_list) {
         secure_transport_ctx->alpn_list = aws_string_new_from_string(alloc, options->alpn_list);
@@ -1005,9 +1094,11 @@ static struct aws_tls_ctx *s_tls_ctx_new(struct aws_allocator *alloc, const stru
         }
     }
 
-    secure_transport_ctx->veriify_peer = options->verify_peer;
+    secure_transport_ctx->verify_peer = options->verify_peer;
     secure_transport_ctx->ca_cert = NULL;
     secure_transport_ctx->certs = NULL;
+    secure_transport_ctx->cleanup_cert = false;
+    secure_transport_ctx->secitem_identity = NULL;
     secure_transport_ctx->ctx.alloc = alloc;
     secure_transport_ctx->ctx.impl = secure_transport_ctx;
     aws_ref_count_init(
@@ -1016,7 +1107,6 @@ static struct aws_tls_ctx *s_tls_ctx_new(struct aws_allocator *alloc, const stru
         (aws_simple_completion_callback *)s_aws_secure_transport_ctx_destroy);
 
     if (aws_tls_options_buf_is_set(&options->certificate) && aws_tls_options_buf_is_set(&options->private_key)) {
-#if !defined(AWS_OS_IOS)
         AWS_LOGF_DEBUG(AWS_LS_IO_TLS, "static: certificate and key have been set, setting them up now.");
 
         if (!aws_text_is_utf8(options->certificate.buffer, options->certificate.len)) {
@@ -1033,31 +1123,64 @@ static struct aws_tls_ctx *s_tls_ctx_new(struct aws_allocator *alloc, const stru
 
         struct aws_byte_cursor cert_chain_cur = aws_byte_cursor_from_buf(&options->certificate);
         struct aws_byte_cursor private_key_cur = aws_byte_cursor_from_buf(&options->private_key);
-        if (aws_import_public_and_private_keys_to_identity(
-                alloc,
-                secure_transport_ctx->wrapped_allocator,
-                &cert_chain_cur,
-                &private_key_cur,
-                &secure_transport_ctx->certs,
-                options->keychain_path)) {
-            AWS_LOGF_ERROR(
-                AWS_LS_IO_TLS, "static: failed to import certificate and private key with error %d.", aws_last_error());
-            goto cleanup_wrapped_allocator;
+        if (aws_is_using_secitem()) {
+            if (aws_secitem_import_cert_and_key(
+                    alloc,
+                    secure_transport_ctx->wrapped_allocator,
+                    &cert_chain_cur,
+                    &private_key_cur,
+                    &secure_transport_ctx->secitem_identity,
+                    &options->secitem_options)) {
+                AWS_LOGF_ERROR(
+                    AWS_LS_IO_TLS,
+                    "static: failed to import certificate and private key with error %d.",
+                    aws_last_error());
+                goto cleanup_wrapped_allocator;
+            }
+        } else {
+            if (aws_import_public_and_private_keys_to_identity(
+                    alloc,
+                    secure_transport_ctx->wrapped_allocator,
+                    &cert_chain_cur,
+                    &private_key_cur,
+                    &secure_transport_ctx->certs,
+                    options->keychain_path)) {
+                AWS_LOGF_ERROR(
+                    AWS_LS_IO_TLS,
+                    "static: failed to import certificate and private key with error %d.",
+                    aws_last_error());
+                goto cleanup_wrapped_allocator;
+            }
+            secure_transport_ctx->cleanup_cert = true;
         }
-#endif
     } else if (aws_tls_options_buf_is_set(&options->pkcs12)) {
-        AWS_LOGF_DEBUG(AWS_LS_IO_TLS, "static: a pkcs$12 certificate and key has been set, setting it up now.");
 
         struct aws_byte_cursor pkcs12_blob_cur = aws_byte_cursor_from_buf(&options->pkcs12);
         struct aws_byte_cursor password_cur = aws_byte_cursor_from_buf(&options->pkcs12_password);
-        if (aws_import_pkcs12_to_identity(
-                secure_transport_ctx->wrapped_allocator,
-                &pkcs12_blob_cur,
-                &password_cur,
-                &secure_transport_ctx->certs)) {
-            AWS_LOGF_ERROR(
-                AWS_LS_IO_TLS, "static: failed to import pkcs#12 certificate with error %d.", aws_last_error());
-            goto cleanup_wrapped_allocator;
+        if (aws_is_using_secitem()) {
+            AWS_LOGF_DEBUG(
+                AWS_LS_IO_TLS, "static: a pkcs#12 certificate and key has been set, setting up for secitem now.");
+            if (aws_secitem_import_pkcs12(
+                    secure_transport_ctx->wrapped_allocator,
+                    &pkcs12_blob_cur,
+                    &password_cur,
+                    &secure_transport_ctx->secitem_identity)) {
+                AWS_LOGF_ERROR(
+                    AWS_LS_IO_TLS, "static: failed to import pkcs#12 certificate with error %d.", aws_last_error());
+                goto cleanup_wrapped_allocator;
+            }
+        } else {
+            AWS_LOGF_DEBUG(
+                AWS_LS_IO_TLS, "static: a pkcs#12 certificate and key has been set, setting up for secKeychain now.");
+            if (aws_import_pkcs12_to_identity(
+                    secure_transport_ctx->wrapped_allocator,
+                    &pkcs12_blob_cur,
+                    &password_cur,
+                    &secure_transport_ctx->certs)) {
+                AWS_LOGF_ERROR(
+                    AWS_LS_IO_TLS, "static: failed to import pkcs#12 certificate with error %d.", aws_last_error());
+                goto cleanup_wrapped_allocator;
+            }
         }
     }
 

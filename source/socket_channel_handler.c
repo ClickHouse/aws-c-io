@@ -122,6 +122,10 @@ static void s_on_readable_notification(struct aws_socket *socket, int error_code
  */
 static void s_do_read(struct socket_handler *socket_handler) {
 
+    if (socket_handler->shutdown_in_progress) {
+        return;
+    }
+
     size_t downstream_window = aws_channel_slot_downstream_read_window(socket_handler->slot);
     size_t max_to_read =
         downstream_window > socket_handler->max_rw_size ? socket_handler->max_rw_size : downstream_window;
@@ -139,17 +143,15 @@ static void s_do_read(struct socket_handler *socket_handler) {
 
     size_t total_read = 0;
     size_t read = 0;
-    while (total_read < max_to_read && !socket_handler->shutdown_in_progress) {
+    int last_error = 0;
+    while (total_read < max_to_read) {
         size_t iter_max_read = max_to_read - total_read;
 
         struct aws_io_message *message = aws_channel_acquire_message_from_pool(
             socket_handler->slot->channel, AWS_IO_MESSAGE_APPLICATION_DATA, iter_max_read);
 
-        if (!message) {
-            break;
-        }
-
         if (aws_socket_read(socket_handler->socket, &message->message_data, &read)) {
+            last_error = aws_last_error();
             aws_mem_release(message->allocator, message);
             break;
         }
@@ -162,6 +164,7 @@ static void s_do_read(struct socket_handler *socket_handler) {
             (unsigned long long)read);
 
         if (aws_channel_slot_send_message(socket_handler->slot, message, AWS_CHANNEL_DIR_READ)) {
+            last_error = aws_last_error();
             aws_mem_release(message->allocator, message);
             break;
         }
@@ -170,30 +173,29 @@ static void s_do_read(struct socket_handler *socket_handler) {
     AWS_LOGF_TRACE(
         AWS_LS_IO_SOCKET_HANDLER,
         "id=%p: total read on this tick %llu",
-        (void *)&socket_handler->slot->handler,
+        (void *)socket_handler->slot->handler,
         (unsigned long long)total_read);
 
     socket_handler->stats.bytes_read += total_read;
 
     /* resubscribe as long as there's no error, just return if we're in a would block scenario. */
     if (total_read < max_to_read) {
-        int last_error = aws_last_error();
+        AWS_ASSERT(last_error != 0);
 
-        if (last_error != AWS_IO_READ_WOULD_BLOCK && !socket_handler->shutdown_in_progress) {
+        if (last_error != AWS_IO_READ_WOULD_BLOCK) {
             aws_channel_shutdown(socket_handler->slot->channel, last_error);
+        } else {
+            AWS_LOGF_TRACE(
+                AWS_LS_IO_SOCKET_HANDLER,
+                "id=%p: out of data to read on socket. "
+                "Waiting on event-loop notification.",
+                (void *)socket_handler->slot->handler);
         }
-
-        AWS_LOGF_TRACE(
-            AWS_LS_IO_SOCKET_HANDLER,
-            "id=%p: out of data to read on socket. "
-            "Waiting on event-loop notification.",
-            (void *)socket_handler->slot->handler);
         return;
     }
     /* in this case, everything was fine, but there's still pending reads. We need to schedule a task to do the read
      * again. */
-    if (!socket_handler->shutdown_in_progress && total_read == socket_handler->max_rw_size &&
-        !socket_handler->read_task_storage.task_fn) {
+    if (total_read == socket_handler->max_rw_size && !socket_handler->read_task_storage.task_fn) {
 
         AWS_LOGF_TRACE(
             AWS_LS_IO_SOCKET_HANDLER,
@@ -206,23 +208,34 @@ static void s_do_read(struct socket_handler *socket_handler) {
     }
 }
 
-/* the socket is either readable or errored out. If it's readable, kick off s_do_read() to do its thing.
- * If an error, start the channel shutdown process. */
+/* the socket is either readable or errored out. If it's readable, kick off s_do_read() to do its thing. */
 static void s_on_readable_notification(struct aws_socket *socket, int error_code, void *user_data) {
     (void)socket;
 
     struct socket_handler *socket_handler = user_data;
-    AWS_LOGF_TRACE(AWS_LS_IO_SOCKET_HANDLER, "id=%p: socket is now readable", (void *)socket_handler->slot->handler);
+    AWS_LOGF_TRACE(
+        AWS_LS_IO_SOCKET_HANDLER,
+        "id=%p: socket on-readable with error code %d(%s)",
+        (void *)socket_handler->slot->handler,
+        error_code,
+        aws_error_name(error_code));
 
-    /* read regardless so we can pick up data that was sent prior to the close. For example, peer sends a TLS ALERT
-     * then immediately closes the socket. On some platforms, we'll never see the readable flag. So we want to make
+    /* Regardless of error code call read() until it reports error or EOF,
+     * so we can pick up data that was sent prior to the close.
+     *
+     * For example, if peer closes the socket immediately after sending the last
+     * bytes of data, the READABLE and HANGUP events arrive simultaneously.
+     *
+     * Another example, peer sends a TLS ALERT then immediately closes the socket.
+     * On some platforms, we'll never see the readable flag. So we want to make
      * sure we read the ALERT, otherwise, we'll end up telling the user that the channel shutdown because of a socket
-     * closure, when in reality it was a TLS error */
+     * closure, when in reality it was a TLS error
+     *
+     * It may take more than one read() to get all remaining data.
+     * Also, if the downstream read-window reaches 0, we need to patiently
+     * wait until the window opens before we can call read() again. */
+    (void)error_code;
     s_do_read(socket_handler);
-
-    if (error_code && !socket_handler->shutdown_in_progress) {
-        aws_channel_shutdown(socket_handler->slot->channel, error_code);
-    }
 }
 
 /* Either the result of a context switch (for fairness in the event loop), or a window update. */
@@ -278,6 +291,39 @@ static void s_close_task(struct aws_channel_task *task, void *arg, aws_task_stat
         socket_handler->slot, AWS_CHANNEL_DIR_WRITE, socket_handler->shutdown_err_code, false);
 }
 
+struct channel_shutdown_close_args {
+    struct aws_channel_handler *handler;
+    int error_code;
+    struct aws_channel *channel;
+    struct aws_channel_slot *slot;
+    enum aws_channel_direction dir;
+    bool free_scarce_resource_immediately;
+    int test_flag;
+};
+
+static void s_shutdown_complete_fn(void *user_data) {
+    struct channel_shutdown_close_args *close_args = user_data;
+
+    /* Schedule a task to complete the shutdown, in case a do_read task is currently pending.
+     * It's OK to delay the shutdown, even when free_scarce_resources_immediately is true,
+     * because the socket has been closed: mitigating the risk that the socket is still being abused by
+     * a hostile peer. */
+    struct socket_handler *socket_handler = close_args->handler->impl;
+    aws_channel_task_init(
+        &socket_handler->shutdown_task_storage, s_close_task, close_args->handler, "socket_handler_close");
+    socket_handler->shutdown_err_code = close_args->error_code;
+    aws_channel_schedule_task_now(close_args->channel, &socket_handler->shutdown_task_storage);
+    aws_mem_release(close_args->handler->alloc, close_args);
+}
+
+static void s_shutdown_read_dir_complete_fn(void *user_data) {
+    struct channel_shutdown_close_args *close_args = user_data;
+
+    aws_channel_slot_on_handler_shutdown_complete(
+        close_args->slot, close_args->dir, close_args->error_code, close_args->free_scarce_resource_immediately);
+    aws_mem_release(close_args->handler->alloc, close_args);
+}
+
 static int s_socket_shutdown(
     struct aws_channel_handler *handler,
     struct aws_channel_slot *slot,
@@ -290,13 +336,26 @@ static int s_socket_shutdown(
     if (dir == AWS_CHANNEL_DIR_READ) {
         AWS_LOGF_TRACE(
             AWS_LS_IO_SOCKET_HANDLER,
-            "id=%p: shutting down read direction with error_code %d",
+            "id=%p: shutting down read direction with error_code %d : %s",
             (void *)handler,
-            error_code);
+            error_code,
+            aws_error_name(error_code));
         if (free_scarce_resource_immediately && aws_socket_is_open(socket_handler->socket)) {
+            struct channel_shutdown_close_args *close_args =
+                aws_mem_calloc(handler->alloc, 1, sizeof(struct channel_shutdown_close_args));
+
+            close_args->error_code = error_code;
+            close_args->handler = handler;
+            close_args->channel = slot->channel;
+            close_args->slot = slot;
+            close_args->free_scarce_resource_immediately = free_scarce_resource_immediately;
+            close_args->dir = dir;
+
+            aws_socket_set_close_complete_callback(socket_handler->socket, s_shutdown_read_dir_complete_fn, close_args);
             if (aws_socket_close(socket_handler->socket)) {
                 return AWS_OP_ERR;
             }
+            return AWS_OP_SUCCESS;
         }
 
         return aws_channel_slot_on_handler_shutdown_complete(slot, dir, error_code, free_scarce_resource_immediately);
@@ -308,16 +367,28 @@ static int s_socket_shutdown(
         (void *)handler,
         error_code);
     if (aws_socket_is_open(socket_handler->socket)) {
+        struct channel_shutdown_close_args *close_args =
+            aws_mem_calloc(handler->alloc, 1, sizeof(struct channel_shutdown_close_args));
+
+        close_args->error_code = error_code;
+        close_args->handler = handler;
+        close_args->channel = slot->channel;
+        close_args->slot = slot;
+        close_args->free_scarce_resource_immediately = free_scarce_resource_immediately;
+        close_args->dir = dir;
+
+        aws_socket_set_close_complete_callback(socket_handler->socket, s_shutdown_complete_fn, close_args);
         aws_socket_close(socket_handler->socket);
+    } else { // If socket is already closed, fire the close task directly.
+        /* Schedule a task to complete the shutdown, in case a do_read task is currently pending.
+         * It's OK to delay the shutdown, even when free_scarce_resources_immediately is true,
+         * because the socket has been closed: mitigating the risk that the socket is still being abused by
+         * a hostile peer. */
+        aws_channel_task_init(&socket_handler->shutdown_task_storage, s_close_task, handler, "socket_handler_close");
+        socket_handler->shutdown_err_code = error_code;
+        aws_channel_schedule_task_now(slot->channel, &socket_handler->shutdown_task_storage);
     }
 
-    /* Schedule a task to complete the shutdown, in case a do_read task is currently pending.
-     * It's OK to delay the shutdown, even when free_scarce_resources_immediately is true,
-     * because the socket has been closed: mitigating the risk that the socket is still being abused by
-     * a hostile peer. */
-    aws_channel_task_init(&socket_handler->shutdown_task_storage, s_close_task, handler, "socket_handler_close");
-    socket_handler->shutdown_err_code = error_code;
-    aws_channel_schedule_task_now(slot->channel, &socket_handler->shutdown_task_storage);
     return AWS_OP_SUCCESS;
 }
 

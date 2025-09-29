@@ -9,14 +9,25 @@
 #ifdef _WIN32
 /* It's ok to include external headers because this is a PRIVATE header file
  * (it is usually a crime to include windows.h from header file) */
-#    include <Windows.h>
+#    define NOMINMAX
+#    define NOCRYPT
+#    include <windows.h>
+
+/* Note: we need defs for crypto definitions, we can get them from windows.h, but
+ * with lean an mean on they will be missing from windows.h.
+ * So instead lets have a proper dependency on the header that defines them, and force them
+ * to not be included in windows.h.
+ */
+#    include <wincrypt.h>
 #endif /* _WIN32 */
 
 #ifdef AWS_OS_APPLE
 /* It's ok to include external headers because this is a PRIVATE header file */
 #    include <CoreFoundation/CFArray.h>
+#    include <Security/Security.h>
 #endif /* AWS_OS_APPLE */
 
+struct aws_secitem_options;
 struct aws_string;
 
 AWS_EXTERN_C_BEGIN
@@ -29,7 +40,6 @@ AWS_IO_API const char *aws_determine_default_pki_dir(void);
 AWS_IO_API const char *aws_determine_default_pki_ca_file(void);
 
 #ifdef AWS_OS_APPLE
-#    if !defined(AWS_OS_IOS)
 /**
  * Imports a PEM armored PKCS#7 public/private key pair
  * into identity for use with SecurityFramework.
@@ -41,7 +51,6 @@ int aws_import_public_and_private_keys_to_identity(
     const struct aws_byte_cursor *private_key,
     CFArrayRef *identity,
     const struct aws_string *keychain_path);
-#    endif /* AWS_OS_IOS */
 
 /**
  * Imports a PKCS#12 file into identity for use with
@@ -64,14 +73,28 @@ int aws_import_trusted_certificates(
     CFArrayRef *certs);
 
 /**
- * Releases identity (the output of the aws_import_* functions).
+ * Imports a PEM armored PKCS#7 public/private key pair
+ * into protected data keychain for use with Apple Network Framework.
+ * Currently only implemented for iOS.
  */
-void aws_release_identity(CFArrayRef identity);
+int aws_secitem_import_cert_and_key(
+    struct aws_allocator *alloc,
+    CFAllocatorRef cf_alloc,
+    const struct aws_byte_cursor *public_cert_chain,
+    const struct aws_byte_cursor *private_key,
+    sec_identity_t *secitem_identity,
+    const struct aws_secitem_options *secitem_options);
 
 /**
- * releases the output of aws_import_trusted_certificates.
+ * Imports a PKCS#12 file into protected data keychain for use with
+ * Apple Network Framework.
+ * Currently only implemented for iOS.
  */
-void aws_release_certificates(CFArrayRef certs);
+int aws_secitem_import_pkcs12(
+    CFAllocatorRef cf_alloc,
+    const struct aws_byte_cursor *pkcs12_cursor,
+    const struct aws_byte_cursor *password,
+    sec_identity_t *out_identity);
 
 #endif /* AWS_OS_APPLE */
 
@@ -113,7 +136,8 @@ AWS_IO_API int aws_import_key_pair_to_cert_context(
     HCERTSTORE *cert_store,
     PCCERT_CONTEXT *certs,
     HCRYPTPROV *crypto_provider,
-    HCRYPTKEY *private_key_handle);
+    HCRYPTKEY *private_key_handle,
+    bool *tls13_disabled);
 
 #endif /* _WIN32 */
 
